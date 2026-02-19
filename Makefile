@@ -4,7 +4,7 @@ LDFLAGS ?=
 LDLIBS ?=
 
 TARGET ?= matmul
-SRC ?= main.c src/matmul_naive.c
+SRC ?= main.c src/matmul_naive.c src/matmul_naive_rowmajor.c
 OBJ := $(SRC:.c=.o)
 ARGS ?=
 

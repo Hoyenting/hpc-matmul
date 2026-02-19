@@ -7,17 +7,39 @@
 #include <string.h>
 
 void matmul_naive(size_t M, size_t N, size_t K,
-                  const double *A, const double *B, double *C);
+                  const double *A, const double *B, double *restrict C);
+void matmul_naive_rowmajor(size_t M, size_t N, size_t K,
+                           const double *A, const double *B,
+                           double *restrict C);
+
+typedef void (*matmul_kernel_t)(size_t M, size_t N, size_t K,
+                                const double *A, const double *B,
+                                double *restrict C);
 
 static volatile double g_sink = 0.0;
 
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s\n"
-            "  %s N [repeats]\n"
-            "  %s M N K [repeats]\n",
+            "  %s [--kernel naive|rowmajor]\n"
+            "  %s [--kernel naive|rowmajor] N [repeats]\n"
+            "  %s [--kernel naive|rowmajor] M N K [repeats]\n",
             prog, prog, prog);
+}
+
+static int resolve_kernel(const char *name, matmul_kernel_t *fn_out,
+                          const char **label_out) {
+    if (strcmp(name, "naive") == 0) {
+        *fn_out = matmul_naive;
+        *label_out = "naive(i-j-k)";
+        return 0;
+    }
+    if (strcmp(name, "rowmajor") == 0) {
+        *fn_out = matmul_naive_rowmajor;
+        *label_out = "rowmajor(i-k-j)";
+        return 0;
+    }
+    return -1;
 }
 
 static int parse_size_arg(const char *s, size_t *out) {
@@ -72,30 +94,44 @@ static void fill_random(double *x, size_t n, uint64_t seed) {
 int main(int argc, char **argv) {
     size_t M = 1024, N = 1024, K = 1024;
     size_t repeats = 5;
+    matmul_kernel_t kernel = matmul_naive;
+    const char *kernel_label = "naive(i-j-k)";
+    int argi = 1;
 
-    if (argc == 2 || argc == 3) {
-        if (parse_size_arg(argv[1], &N) != 0) {
+    if (argc >= 3 &&
+        (strcmp(argv[1], "--kernel") == 0 || strcmp(argv[1], "-k") == 0)) {
+        if (resolve_kernel(argv[2], &kernel, &kernel_label) != 0) {
+            fprintf(stderr, "unknown kernel: %s\n", argv[2]);
+            usage(argv[0]);
+            return 1;
+        }
+        argi = 3;
+    }
+
+    const int rem = argc - argi;
+    if (rem == 1 || rem == 2) {
+        if (parse_size_arg(argv[argi], &N) != 0) {
             usage(argv[0]);
             return 1;
         }
         M = N;
         K = N;
-        if (argc == 3 && parse_size_arg(argv[2], &repeats) != 0) {
+        if (rem == 2 && parse_size_arg(argv[argi + 1], &repeats) != 0) {
             usage(argv[0]);
             return 1;
         }
-    } else if (argc == 4 || argc == 5) {
-        if (parse_size_arg(argv[1], &M) != 0 ||
-            parse_size_arg(argv[2], &N) != 0 ||
-            parse_size_arg(argv[3], &K) != 0) {
+    } else if (rem == 3 || rem == 4) {
+        if (parse_size_arg(argv[argi], &M) != 0 ||
+            parse_size_arg(argv[argi + 1], &N) != 0 ||
+            parse_size_arg(argv[argi + 2], &K) != 0) {
             usage(argv[0]);
             return 1;
         }
-        if (argc == 5 && parse_size_arg(argv[4], &repeats) != 0) {
+        if (rem == 4 && parse_size_arg(argv[argi + 3], &repeats) != 0) {
             usage(argv[0]);
             return 1;
         }
-    } else if (argc != 1) {
+    } else if (rem != 0) {
         usage(argv[0]);
         return 1;
     }
@@ -135,15 +171,16 @@ int main(int argc, char **argv) {
 
     fill_random(A, elems_a, 0x123456789abcdef0ULL);
     fill_random(B, elems_b, 0x0fedcba987654321ULL);
-    memset(C, 0, bytes_c);
 
-    matmul_naive(M, N, K, A, B, C);
+    memset(C, 0, bytes_c);
+    kernel(M, N, K, A, B, C);
 
     double best_sec = 1e300;
     double total_sec = 0.0;
     for (size_t r = 0; r < repeats; ++r) {
+        memset(C, 0, bytes_c);
         double t0 = now_sec();
-        matmul_naive(M, N, K, A, B, C);
+        kernel(M, N, K, A, B, C);
         double t1 = now_sec();
         double dt = t1 - t0;
         if (dt < best_sec) {
@@ -160,7 +197,8 @@ int main(int argc, char **argv) {
     const double gib_total =
         (double)(bytes_a + bytes_b + bytes_c) / (1024.0 * 1024.0 * 1024.0);
 
-    printf("matmul_naive baseline (double, row-major)\n");
+    printf("matmul baseline (double, row-major)\n");
+    printf("kernel=%s\n", kernel_label);
     printf("M=%zu N=%zu K=%zu repeats=%zu alignment=%zuB\n", M, N, K, repeats,
            alignment);
     printf("A=%.3f MiB B=%.3f MiB C=%.3f MiB total=%.3f GiB\n",
