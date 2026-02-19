@@ -1,0 +1,17 @@
+# 執行檔
+matrix_benchmark
+*.out
+*.exe
+
+# 編譯產生的物件檔
+*.o
+*.obj
+
+# Profiling 產生的數據 (如 gprof 或 Google Benchmark)
+gmon.out
+*.perf
+reports/
+
+# IDE 設定 (如 VS Code)
+.vscode/
+.DS_Store
