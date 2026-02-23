@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <mach/mach_time.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,9 +22,9 @@ static volatile double g_sink = 0.0;
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--kernel naive|rowmajor]\n"
-            "  %s [--kernel naive|rowmajor] N [repeats]\n"
-            "  %s [--kernel naive|rowmajor] M N K [repeats]\n",
+            "  %s [--kernel naive|rowmajor] [--verify] [--tol TOL]\n"
+            "  %s [--kernel naive|rowmajor] [--verify] [--tol TOL] N [repeats]\n"
+            "  %s [--kernel naive|rowmajor] [--verify] [--tol TOL] M N K [repeats]\n",
             prog, prog, prog);
 }
 
@@ -50,6 +51,17 @@ static int parse_size_arg(const char *s, size_t *out) {
         return -1;
     }
     *out = (size_t)v;
+    return 0;
+}
+
+static int parse_double_arg(const char *s, double *out) {
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno != 0 || end == s || *end != '\0' || !isfinite(v)) {
+        return -1;
+    }
+    *out = v;
     return 0;
 }
 
@@ -91,21 +103,81 @@ static void fill_random(double *x, size_t n, uint64_t seed) {
     }
 }
 
+static int cmp_double_asc(const void *a, const void *b) {
+    const double da = *(const double *)a;
+    const double db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
+static int verify_result(const double *C_ref, const double *C_test, size_t n,
+                         double tol, double *max_abs_err_out,
+                         double *max_rel_err_out) {
+    double max_abs_err = 0.0;
+    double max_rel_err = 0.0;
+    int ok = 1;
+
+    for (size_t i = 0; i < n; ++i) {
+        const double ref = C_ref[i];
+        const double test = C_test[i];
+        const double abs_err = fabs(test - ref);
+        const double denom = fabs(ref) > 1e-300 ? fabs(ref) : 1.0;
+        const double rel_err = abs_err / denom;
+
+        if (abs_err > max_abs_err) {
+            max_abs_err = abs_err;
+        }
+        if (rel_err > max_rel_err) {
+            max_rel_err = rel_err;
+        }
+        if (!(abs_err <= tol || rel_err <= tol)) {
+            ok = 0;
+        }
+    }
+
+    *max_abs_err_out = max_abs_err;
+    *max_rel_err_out = max_rel_err;
+    return ok;
+}
+
 int main(int argc, char **argv) {
     size_t M = 1024, N = 1024, K = 1024;
     size_t repeats = 5;
     matmul_kernel_t kernel = matmul_naive;
     const char *kernel_label = "naive(i-j-k)";
+    int verify = 0;
+    double tol = 1e-9;
     int argi = 1;
 
-    if (argc >= 3 &&
-        (strcmp(argv[1], "--kernel") == 0 || strcmp(argv[1], "-k") == 0)) {
-        if (resolve_kernel(argv[2], &kernel, &kernel_label) != 0) {
-            fprintf(stderr, "unknown kernel: %s\n", argv[2]);
-            usage(argv[0]);
-            return 1;
+    while (argi < argc) {
+        if (strcmp(argv[argi], "--verify") == 0) {
+            verify = 1;
+            ++argi;
+            continue;
         }
-        argi = 3;
+        if (strcmp(argv[argi], "--kernel") == 0 || strcmp(argv[argi], "-k") == 0) {
+            if (argi + 1 >= argc) {
+                usage(argv[0]);
+                return 1;
+            }
+            if (resolve_kernel(argv[argi + 1], &kernel, &kernel_label) != 0) {
+                fprintf(stderr, "unknown kernel: %s\n", argv[argi + 1]);
+                usage(argv[0]);
+                return 1;
+            }
+            argi += 2;
+            continue;
+        }
+        if (strcmp(argv[argi], "--tol") == 0) {
+            if (argi + 1 >= argc || parse_double_arg(argv[argi + 1], &tol) != 0 ||
+                tol <= 0.0) {
+                fprintf(stderr, "invalid --tol value\n");
+                usage(argv[0]);
+                return 1;
+            }
+            argi += 2;
+            continue;
+        }
+        break;
     }
 
     const int rem = argc - argi;
@@ -160,40 +232,90 @@ int main(int argc, char **argv) {
     double *A = (double *)aligned_alloc_or_null(alignment, bytes_a);
     double *B = (double *)aligned_alloc_or_null(alignment, bytes_b);
     double *C = (double *)aligned_alloc_or_null(alignment, bytes_c);
-    if (!A || !B || !C) {
-        fprintf(stderr, "allocation failed (A=%p, B=%p, C=%p)\n", (void *)A, (void *)B,
-                (void *)C);
+    double *times = (double *)malloc(repeats * sizeof(double));
+    if (!A || !B || !C || !times) {
+        fprintf(stderr, "allocation failed (A=%p, B=%p, C=%p, times=%p)\n", (void *)A,
+                (void *)B, (void *)C, (void *)times);
         free(A);
         free(B);
         free(C);
+        free(times);
         return 1;
     }
 
     fill_random(A, elems_a, 0x123456789abcdef0ULL);
     fill_random(B, elems_b, 0x0fedcba987654321ULL);
 
-    memset(C, 0, bytes_c);
+    if (verify) {
+        double *C_ref = (double *)aligned_alloc_or_null(alignment, bytes_c);
+        if (!C_ref) {
+            fprintf(stderr, "verification allocation failed (C_ref)\n");
+            free(A);
+            free(B);
+            free(C);
+            free(times);
+            return 1;
+        }
+
+        matmul_naive(M, N, K, A, B, C_ref);
+        kernel(M, N, K, A, B, C);
+
+        double max_abs_err = 0.0;
+        double max_rel_err = 0.0;
+        int ok = verify_result(C_ref, C, elems_c, tol, &max_abs_err, &max_rel_err);
+
+        printf("verify=%s tol=%.3e max_abs_err=%.3e max_rel_err=%.3e\n",
+               ok ? "PASS" : "FAIL", tol, max_abs_err, max_rel_err);
+
+        free(C_ref);
+        if (!ok) {
+            fprintf(stderr,
+                    "verification failed: error exceeds tolerance (tol=%.3e)\n", tol);
+            free(A);
+            free(B);
+            free(C);
+            free(times);
+            return 2;
+        }
+    }
+
     kernel(M, N, K, A, B, C);
 
-    double best_sec = 1e300;
-    double total_sec = 0.0;
+    double min_sec = 1e300;
+    double sum_sec = 0.0;
     for (size_t r = 0; r < repeats; ++r) {
-        memset(C, 0, bytes_c);
         double t0 = now_sec();
         kernel(M, N, K, A, B, C);
         double t1 = now_sec();
         double dt = t1 - t0;
-        if (dt < best_sec) {
-            best_sec = dt;
+        times[r] = dt;
+        if (dt < min_sec) {
+            min_sec = dt;
         }
-        total_sec += dt;
+        sum_sec += dt;
         g_sink += C[r % elems_c];
     }
 
-    const double avg_sec = total_sec / (double)repeats;
+    const double mean_sec = sum_sec / (double)repeats;
+    double var_acc = 0.0;
+    for (size_t r = 0; r < repeats; ++r) {
+        const double d = times[r] - mean_sec;
+        var_acc += d * d;
+    }
+    const double stddev_sec = sqrt(var_acc / (double)repeats);
+
+    qsort(times, repeats, sizeof(double), cmp_double_asc);
+    double median_sec = 0.0;
+    if ((repeats & 1U) != 0U) {
+        median_sec = times[repeats / 2];
+    } else {
+        median_sec = 0.5 * (times[repeats / 2 - 1] + times[repeats / 2]);
+    }
+
     const double flops = 2.0 * (double)M * (double)N * (double)K;
-    const double gflops_best = flops / best_sec / 1e9;
-    const double gflops_avg = flops / avg_sec / 1e9;
+    const double gflops_best = flops / min_sec / 1e9;
+    const double gflops_median = flops / median_sec / 1e9;
+    const double gflops_mean = flops / mean_sec / 1e9;
     const double gib_total =
         (double)(bytes_a + bytes_b + bytes_c) / (1024.0 * 1024.0 * 1024.0);
 
@@ -204,12 +326,15 @@ int main(int argc, char **argv) {
     printf("A=%.3f MiB B=%.3f MiB C=%.3f MiB total=%.3f GiB\n",
            (double)bytes_a / (1024.0 * 1024.0), (double)bytes_b / (1024.0 * 1024.0),
            (double)bytes_c / (1024.0 * 1024.0), gib_total);
-    printf("best_time=%.6f s  avg_time=%.6f s\n", best_sec, avg_sec);
-    printf("best=%.2f GFLOPS  avg=%.2f GFLOPS\n", gflops_best, gflops_avg);
+    printf("min_time=%.6f s  median_time=%.6f s\n", min_sec, median_sec);
+    printf("mean_time=%.6f s  stddev_time=%.6f s\n", mean_sec, stddev_sec);
+    printf("gflops_best=%.2f  gflops_median=%.2f  gflops_mean=%.2f\n", gflops_best,
+           gflops_median, gflops_mean);
     printf("checksum_guard=%.6e\n", (double)g_sink);
 
     free(A);
     free(B);
     free(C);
+    free(times);
     return 0;
 }
