@@ -7,37 +7,44 @@
 #include <stdlib.h>
 #include <string.h>
 
-void matmul_naive(size_t M, size_t N, size_t K,
-                  const double *A, const double *B, double *restrict C);
-void matmul_naive_rowmajor(size_t M, size_t N, size_t K,
-                           const double *A, const double *B,
-                           double *restrict C);
+#include "matmul.h"
 
 typedef void (*matmul_kernel_t)(size_t M, size_t N, size_t K,
                                 const double *A, const double *B,
                                 double *restrict C);
+
+typedef enum kernel_kind {
+    KERNEL_NAIVE = 0,
+    KERNEL_ROWMAJOR = 1,
+    KERNEL_BLOCK = 2
+} kernel_kind_t;
 
 static volatile double g_sink = 0.0;
 
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s [--kernel naive|rowmajor] [--verify] [--tol TOL]\n"
-            "  %s [--kernel naive|rowmajor] [--verify] [--tol TOL] N [repeats]\n"
-            "  %s [--kernel naive|rowmajor] [--verify] [--tol TOL] M N K [repeats]\n",
+            "  %s [--kernel naive|rowmajor|block] [--verify] [--tol TOL]\n"
+            "  %s [--kernel naive|rowmajor|block] [--verify] [--tol TOL] [--bm BM] [--bk BK] [--bn BN] N [repeats]\n"
+            "  %s [--kernel naive|rowmajor|block] [--verify] [--tol TOL] [--bm BM] [--bk BK] [--bn BN] M N K [repeats]\n",
             prog, prog, prog);
 }
 
 static int resolve_kernel(const char *name, matmul_kernel_t *fn_out,
-                          const char **label_out) {
+                          kernel_kind_t *kind_out) {
     if (strcmp(name, "naive") == 0) {
         *fn_out = matmul_naive;
-        *label_out = "naive(i-j-k)";
+        *kind_out = KERNEL_NAIVE;
         return 0;
     }
     if (strcmp(name, "rowmajor") == 0) {
         *fn_out = matmul_naive_rowmajor;
-        *label_out = "rowmajor(i-k-j)";
+        *kind_out = KERNEL_ROWMAJOR;
+        return 0;
+    }
+    if (strcmp(name, "block") == 0 || strcmp(name, "blocked") == 0) {
+        *fn_out = matmul_block;
+        *kind_out = KERNEL_BLOCK;
         return 0;
     }
     return -1;
@@ -143,7 +150,8 @@ int main(int argc, char **argv) {
     size_t M = 1024, N = 1024, K = 1024;
     size_t repeats = 5;
     matmul_kernel_t kernel = matmul_naive;
-    const char *kernel_label = "naive(i-j-k)";
+    kernel_kind_t kernel_kind = KERNEL_NAIVE;
+    size_t opt_bm = 0, opt_bk = 0, opt_bn = 0;
     int verify = 0;
     double tol = 1e-9;
     int argi = 1;
@@ -159,8 +167,35 @@ int main(int argc, char **argv) {
                 usage(argv[0]);
                 return 1;
             }
-            if (resolve_kernel(argv[argi + 1], &kernel, &kernel_label) != 0) {
+            if (resolve_kernel(argv[argi + 1], &kernel, &kernel_kind) != 0) {
                 fprintf(stderr, "unknown kernel: %s\n", argv[argi + 1]);
+                usage(argv[0]);
+                return 1;
+            }
+            argi += 2;
+            continue;
+        }
+        if (strcmp(argv[argi], "--bm") == 0) {
+            if (argi + 1 >= argc || parse_size_arg(argv[argi + 1], &opt_bm) != 0) {
+                fprintf(stderr, "invalid --bm value\n");
+                usage(argv[0]);
+                return 1;
+            }
+            argi += 2;
+            continue;
+        }
+        if (strcmp(argv[argi], "--bk") == 0) {
+            if (argi + 1 >= argc || parse_size_arg(argv[argi + 1], &opt_bk) != 0) {
+                fprintf(stderr, "invalid --bk value\n");
+                usage(argv[0]);
+                return 1;
+            }
+            argi += 2;
+            continue;
+        }
+        if (strcmp(argv[argi], "--bn") == 0) {
+            if (argi + 1 >= argc || parse_size_arg(argv[argi + 1], &opt_bn) != 0) {
+                fprintf(stderr, "invalid --bn value\n");
                 usage(argv[0]);
                 return 1;
             }
@@ -206,6 +241,21 @@ int main(int argc, char **argv) {
     } else if (rem != 0) {
         usage(argv[0]);
         return 1;
+    }
+
+    if (opt_bm > 0 || opt_bk > 0 || opt_bn > 0) {
+        size_t bm = 0, bk = 0, bn = 0;
+        matmul_block_get_tiles(&bm, &bk, &bn);
+        if (opt_bm > 0) {
+            bm = opt_bm;
+        }
+        if (opt_bk > 0) {
+            bk = opt_bk;
+        }
+        if (opt_bn > 0) {
+            bn = opt_bn;
+        }
+        matmul_block_set_tiles(bm, bk, bn);
     }
 
     if (repeats == 0) {
@@ -318,7 +368,19 @@ int main(int argc, char **argv) {
     const double gflops_mean = flops / mean_sec / 1e9;
     const double gib_total =
         (double)(bytes_a + bytes_b + bytes_c) / (1024.0 * 1024.0 * 1024.0);
+    char kernel_label[128];
+    if (kernel_kind == KERNEL_NAIVE) {
+        (void)snprintf(kernel_label, sizeof(kernel_label), "naive(i-j-k)");
+    } else if (kernel_kind == KERNEL_ROWMAJOR) {
+        (void)snprintf(kernel_label, sizeof(kernel_label), "rowmajor(i-k-j)");
+    } else {
+        size_t bm = 0, bk = 0, bn = 0;
+        matmul_block_get_tiles(&bm, &bk, &bn);
+        (void)snprintf(kernel_label, sizeof(kernel_label),
+                       "blocked(ii-kk-jj, i-k-j) BM=%zu BN=%zu BK=%zu", bm, bn, bk);
+    }
 
+    printf("------------------------------------------------------------\n");
     printf("matmul baseline (double, row-major)\n");
     printf("kernel=%s\n", kernel_label);
     printf("M=%zu N=%zu K=%zu repeats=%zu alignment=%zuB\n", M, N, K, repeats,
@@ -331,6 +393,7 @@ int main(int argc, char **argv) {
     printf("gflops_best=%.2f  gflops_median=%.2f  gflops_mean=%.2f\n", gflops_best,
            gflops_median, gflops_mean);
     printf("checksum_guard=%.6e\n", (double)g_sink);
+    printf("------------------------------------------------------------\n");
 
     free(A);
     free(B);
