@@ -116,6 +116,53 @@ static int cmp_double_asc(const void *a, const void *b) {
     return (da > db) - (da < db);
 }
 
+typedef struct stats {
+    double min;
+    double median;
+    double mean;
+    double stddev;
+} stats_t;
+
+static int compute_stats(const double *values, size_t n, stats_t *out) {
+    double *sorted = (double *)malloc(n * sizeof(double));
+    if (!sorted) {
+        return -1;
+    }
+
+    double sum = 0.0;
+    double min_v = values[0];
+    for (size_t i = 0; i < n; ++i) {
+        sorted[i] = values[i];
+        sum += values[i];
+        if (values[i] < min_v) {
+            min_v = values[i];
+        }
+    }
+    const double mean = sum / (double)n;
+
+    double var_acc = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double d = values[i] - mean;
+        var_acc += d * d;
+    }
+    const double stddev = sqrt(var_acc / (double)n);
+
+    qsort(sorted, n, sizeof(double), cmp_double_asc);
+    double median = 0.0;
+    if ((n & 1U) != 0U) {
+        median = sorted[n / 2];
+    } else {
+        median = 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
+    }
+
+    out->min = min_v;
+    out->mean = mean;
+    out->median = median;
+    out->stddev = stddev;
+    free(sorted);
+    return 0;
+}
+
 static int verify_result(const double *C_ref, const double *C_test, size_t n,
                          double tol, double *max_abs_err_out,
                          double *max_rel_err_out) {
@@ -282,14 +329,20 @@ int main(int argc, char **argv) {
     double *A = (double *)aligned_alloc_or_null(alignment, bytes_a);
     double *B = (double *)aligned_alloc_or_null(alignment, bytes_b);
     double *C = (double *)aligned_alloc_or_null(alignment, bytes_c);
-    double *times = (double *)malloc(repeats * sizeof(double));
-    if (!A || !B || !C || !times) {
-        fprintf(stderr, "allocation failed (A=%p, B=%p, C=%p, times=%p)\n", (void *)A,
-                (void *)B, (void *)C, (void *)times);
+    double *clear_times = (double *)malloc(repeats * sizeof(double));
+    double *compute_times = (double *)malloc(repeats * sizeof(double));
+    double *total_times = (double *)malloc(repeats * sizeof(double));
+    if (!A || !B || !C || !clear_times || !compute_times || !total_times) {
+        fprintf(stderr,
+                "allocation failed (A=%p, B=%p, C=%p, clear=%p, compute=%p, total=%p)\n",
+                (void *)A, (void *)B, (void *)C, (void *)clear_times,
+                (void *)compute_times, (void *)total_times);
         free(A);
         free(B);
         free(C);
-        free(times);
+        free(clear_times);
+        free(compute_times);
+        free(total_times);
         return 1;
     }
 
@@ -303,11 +356,15 @@ int main(int argc, char **argv) {
             free(A);
             free(B);
             free(C);
-            free(times);
+            free(clear_times);
+            free(compute_times);
+            free(total_times);
             return 1;
         }
 
+        memset(C_ref, 0, bytes_c);
         matmul_naive(M, N, K, A, B, C_ref);
+        memset(C, 0, bytes_c);
         kernel(M, N, K, A, B, C);
 
         double max_abs_err = 0.0;
@@ -324,48 +381,53 @@ int main(int argc, char **argv) {
             free(A);
             free(B);
             free(C);
-            free(times);
+            free(clear_times);
+            free(compute_times);
+            free(total_times);
             return 2;
         }
     }
 
+    memset(C, 0, bytes_c);
     kernel(M, N, K, A, B, C);
 
-    double min_sec = 1e300;
-    double sum_sec = 0.0;
     for (size_t r = 0; r < repeats; ++r) {
-        double t0 = now_sec();
+        const double t_total0 = now_sec();
+        const double t_clear0 = now_sec();
+        memset(C, 0, bytes_c);
+        const double t_clear1 = now_sec();
+        const double t_compute0 = t_clear1;
         kernel(M, N, K, A, B, C);
-        double t1 = now_sec();
-        double dt = t1 - t0;
-        times[r] = dt;
-        if (dt < min_sec) {
-            min_sec = dt;
-        }
-        sum_sec += dt;
+        const double t_compute1 = now_sec();
+        clear_times[r] = t_clear1 - t_clear0;
+        compute_times[r] = t_compute1 - t_compute0;
+        total_times[r] = t_compute1 - t_total0;
         g_sink += C[r % elems_c];
     }
 
-    const double mean_sec = sum_sec / (double)repeats;
-    double var_acc = 0.0;
-    for (size_t r = 0; r < repeats; ++r) {
-        const double d = times[r] - mean_sec;
-        var_acc += d * d;
-    }
-    const double stddev_sec = sqrt(var_acc / (double)repeats);
-
-    qsort(times, repeats, sizeof(double), cmp_double_asc);
-    double median_sec = 0.0;
-    if ((repeats & 1U) != 0U) {
-        median_sec = times[repeats / 2];
-    } else {
-        median_sec = 0.5 * (times[repeats / 2 - 1] + times[repeats / 2]);
+    stats_t clear_stats;
+    stats_t compute_stats_v;
+    stats_t total_stats;
+    if (compute_stats(clear_times, repeats, &clear_stats) != 0 ||
+        compute_stats(compute_times, repeats, &compute_stats_v) != 0 ||
+        compute_stats(total_times, repeats, &total_stats) != 0) {
+        fprintf(stderr, "failed to compute timing statistics\n");
+        free(A);
+        free(B);
+        free(C);
+        free(clear_times);
+        free(compute_times);
+        free(total_times);
+        return 1;
     }
 
     const double flops = 2.0 * (double)M * (double)N * (double)K;
-    const double gflops_best = flops / min_sec / 1e9;
-    const double gflops_median = flops / median_sec / 1e9;
-    const double gflops_mean = flops / mean_sec / 1e9;
+    const double gflops_compute_best = flops / compute_stats_v.min / 1e9;
+    const double gflops_compute_median = flops / compute_stats_v.median / 1e9;
+    const double gflops_compute_mean = flops / compute_stats_v.mean / 1e9;
+    const double gflops_total_best = flops / total_stats.min / 1e9;
+    const double gflops_total_median = flops / total_stats.median / 1e9;
+    const double gflops_total_mean = flops / total_stats.mean / 1e9;
     const double gib_total =
         (double)(bytes_a + bytes_b + bytes_c) / (1024.0 * 1024.0 * 1024.0);
     char kernel_label[128];
@@ -377,7 +439,7 @@ int main(int argc, char **argv) {
         size_t bm = 0, bk = 0, bn = 0;
         matmul_block_get_tiles(&bm, &bk, &bn);
         (void)snprintf(kernel_label, sizeof(kernel_label),
-                       "blocked(ii-kk-jj, i-k-j) BM=%zu BN=%zu BK=%zu", bm, bn, bk);
+                       "blocked(ii-jj-kk, i-k-j) BM=%zu BN=%zu BK=%zu", bm, bn, bk);
     }
 
     printf("------------------------------------------------------------\n");
@@ -388,16 +450,27 @@ int main(int argc, char **argv) {
     printf("A=%.3f MiB B=%.3f MiB C=%.3f MiB total=%.3f GiB\n",
            (double)bytes_a / (1024.0 * 1024.0), (double)bytes_b / (1024.0 * 1024.0),
            (double)bytes_c / (1024.0 * 1024.0), gib_total);
-    printf("min_time=%.6f s  median_time=%.6f s\n", min_sec, median_sec);
-    printf("mean_time=%.6f s  stddev_time=%.6f s\n", mean_sec, stddev_sec);
-    printf("gflops_best=%.2f  gflops_median=%.2f  gflops_mean=%.2f\n", gflops_best,
-           gflops_median, gflops_mean);
+    printf("clear_time:   min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
+           clear_stats.min, clear_stats.median, clear_stats.mean,
+           clear_stats.stddev);
+    printf("compute_time: min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
+           compute_stats_v.min, compute_stats_v.median, compute_stats_v.mean,
+           compute_stats_v.stddev);
+    printf("total_time:   min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
+           total_stats.min, total_stats.median, total_stats.mean,
+           total_stats.stddev);
+    printf("gflops_compute: best=%.2f  median=%.2f  mean=%.2f\n",
+           gflops_compute_best, gflops_compute_median, gflops_compute_mean);
+    printf("gflops_total:   best=%.2f  median=%.2f  mean=%.2f\n", gflops_total_best,
+           gflops_total_median, gflops_total_mean);
     printf("checksum_guard=%.6e\n", (double)g_sink);
     printf("------------------------------------------------------------\n");
 
     free(A);
     free(B);
     free(C);
-    free(times);
+    free(clear_times);
+    free(compute_times);
+    free(total_times);
     return 0;
 }
