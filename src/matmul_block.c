@@ -53,25 +53,24 @@ void matmul_block(size_t M, size_t N, size_t K,
     const size_t BK = g_block_bk;
     const size_t BN = g_block_bn;
 
+    for (size_t i = 0; i < M; ++i) {
+        double *c_row = &C[i * N];
+        for (size_t j = 0; j < N; ++j) {
+            c_row[j] = 0.0;
+        }
+    }
+
     for (size_t ii = 0; ii < M; ii += BM) {
         const size_t i_end = (ii + BM < M) ? (ii + BM) : M;
 
-        for (size_t kk = 0; kk < K; kk += BK) {
-            const size_t k_end = (kk + BK < K) ? (kk + BK) : K;
+        for (size_t jj = 0; jj < N; jj += BN) {
+            const size_t j_end = (jj + BN < N) ? (jj + BN) : N;
 
-            for (size_t jj = 0; jj < N; jj += BN) {
-                const size_t j_end = (jj + BN < N) ? (jj + BN) : N;
+            for (size_t kk = 0; kk < K; kk += BK) {
+                const size_t k_end = (kk + BK < K) ? (kk + BK) : K;
 
                 for (size_t i = ii; i < i_end; ++i) {
                     double *c_row = &C[i * N];
-
-                    /* Initialize this C tile only once at the first kk block. */
-                    if (kk == 0) {
-                        for (size_t j = jj; j < j_end; ++j) {
-                            c_row[j] = 0.0;
-                        }
-                    }
-
                     for (size_t k = kk; k < k_end; ++k) {
                         const double aik = A[i * K + k];
                         const double *b_row = &B[k * N];
