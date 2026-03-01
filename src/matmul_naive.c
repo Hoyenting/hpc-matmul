@@ -1,4 +1,4 @@
-#include <stddef.h>
+#include "matmul.h"
 
 /*
  * Baseline matrix multiplication (row-major):

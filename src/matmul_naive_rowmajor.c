@@ -1,4 +1,4 @@
-#include <stddef.h>
+#include "matmul.h"
 
 /*
  * Row-major friendly baseline:

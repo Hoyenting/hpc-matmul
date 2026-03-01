@@ -1,10 +1,10 @@
 CC ?= cc
-CFLAGS ?= -std=c11 -Wall -Wextra -O2
+CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Iinclude
 LDFLAGS ?=
 LDLIBS ?=
 
 TARGET ?= matmul
-SRC ?= main.c src/matmul_naive.c src/matmul_naive_rowmajor.c
+SRC ?= main.c src/matmul_naive.c src/matmul_naive_rowmajor.c src/matmul_block.c
 OBJ := $(SRC:.c=.o)
 ARGS ?=
 
