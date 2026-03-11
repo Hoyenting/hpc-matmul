@@ -26,8 +26,10 @@ static void usage(const char *prog) {
             "Usage:\n"
             "  %s [--kernel naive|rowmajor|block] [--verify] [--tol TOL]\n"
             "  %s [--kernel naive|rowmajor|block] [--verify] [--tol TOL] [--bm BM] [--bk BK] [--bn BN] N [repeats]\n"
-            "  %s [--kernel naive|rowmajor|block] [--verify] [--tol TOL] [--bm BM] [--bk BK] [--bn BN] M N K [repeats]\n",
-            prog, prog, prog);
+            "  %s [--kernel naive|rowmajor|block] [--verify] [--tol TOL] [--bm BM] [--bk BK] [--bn BN] M N K [repeats]\n"
+            "  %s --kernel block [--verify] roundtile N [repeats]\n"
+            "  %s --kernel block [--verify] roundtile M N K [repeats]\n",
+            prog, prog, prog, prog, prog);
 }
 
 static int resolve_kernel(const char *name, matmul_kernel_t *fn_out,
@@ -123,6 +125,28 @@ typedef struct stats {
     double stddev;
 } stats_t;
 
+typedef struct benchmark_ctx {
+    size_t M;
+    size_t N;
+    size_t K;
+    size_t repeats;
+    size_t bytes_a;
+    size_t bytes_b;
+    size_t bytes_c;
+    size_t elems_c;
+    size_t alignment;
+    int verify;
+    double tol;
+    kernel_kind_t kernel_kind;
+    matmul_kernel_t kernel;
+    const double *A;
+    const double *B;
+    double *C;
+    double *clear_times;
+    double *compute_times;
+    double *total_times;
+} benchmark_ctx_t;
+
 static int compute_stats(const double *values, size_t n, stats_t *out) {
     double *sorted = (double *)malloc(n * sizeof(double));
     if (!sorted) {
@@ -193,12 +217,122 @@ static int verify_result(const double *C_ref, const double *C_test, size_t n,
     return ok;
 }
 
+static void build_kernel_label(kernel_kind_t kernel_kind, char *buf,
+                               size_t buf_size) {
+    if (kernel_kind == KERNEL_NAIVE) {
+        (void)snprintf(buf, buf_size, "naive(i-j-k)");
+    } else if (kernel_kind == KERNEL_ROWMAJOR) {
+        (void)snprintf(buf, buf_size, "rowmajor(i-k-j)");
+    } else {
+        size_t bm = 0, bk = 0, bn = 0;
+        matmul_block_get_tiles(&bm, &bk, &bn);
+        (void)snprintf(buf, buf_size,
+                       "blocked(ii-jj-kk, i-k-j) BM=%zu BN=%zu BK=%zu", bm, bn, bk);
+    }
+}
+
+static int run_benchmark(const benchmark_ctx_t *ctx) {
+    if (ctx->verify) {
+        double *C_ref = (double *)aligned_alloc_or_null(ctx->alignment, ctx->bytes_c);
+        if (!C_ref) {
+            fprintf(stderr, "verification allocation failed (C_ref)\n");
+            return 1;
+        }
+
+        memset(C_ref, 0, ctx->bytes_c);
+        matmul_naive(ctx->M, ctx->N, ctx->K, ctx->A, ctx->B, C_ref);
+        memset(ctx->C, 0, ctx->bytes_c);
+        ctx->kernel(ctx->M, ctx->N, ctx->K, ctx->A, ctx->B, ctx->C);
+
+        double max_abs_err = 0.0;
+        double max_rel_err = 0.0;
+        int ok = verify_result(C_ref, ctx->C, ctx->elems_c, ctx->tol, &max_abs_err,
+                               &max_rel_err);
+        printf("verify=%s tol=%.3e max_abs_err=%.3e max_rel_err=%.3e\n",
+               ok ? "PASS" : "FAIL", ctx->tol, max_abs_err, max_rel_err);
+        free(C_ref);
+        if (!ok) {
+            fprintf(stderr,
+                    "verification failed: error exceeds tolerance (tol=%.3e)\n",
+                    ctx->tol);
+            return 2;
+        }
+    }
+
+    memset(ctx->C, 0, ctx->bytes_c);
+    ctx->kernel(ctx->M, ctx->N, ctx->K, ctx->A, ctx->B, ctx->C);
+
+    for (size_t r = 0; r < ctx->repeats; ++r) {
+        const double t_total0 = now_sec();
+        const double t_clear0 = now_sec();
+        memset(ctx->C, 0, ctx->bytes_c);
+        const double t_clear1 = now_sec();
+        const double t_compute0 = t_clear1;
+        ctx->kernel(ctx->M, ctx->N, ctx->K, ctx->A, ctx->B, ctx->C);
+        const double t_compute1 = now_sec();
+        ctx->clear_times[r] = t_clear1 - t_clear0;
+        ctx->compute_times[r] = t_compute1 - t_compute0;
+        ctx->total_times[r] = t_compute1 - t_total0;
+        g_sink += ctx->C[r % ctx->elems_c];
+    }
+
+    stats_t clear_stats;
+    stats_t compute_stats_v;
+    stats_t total_stats;
+    if (compute_stats(ctx->clear_times, ctx->repeats, &clear_stats) != 0 ||
+        compute_stats(ctx->compute_times, ctx->repeats, &compute_stats_v) != 0 ||
+        compute_stats(ctx->total_times, ctx->repeats, &total_stats) != 0) {
+        fprintf(stderr, "failed to compute timing statistics\n");
+        return 1;
+    }
+
+    const double flops = 2.0 * (double)ctx->M * (double)ctx->N * (double)ctx->K;
+    const double gflops_compute_best = flops / compute_stats_v.min / 1e9;
+    const double gflops_compute_median = flops / compute_stats_v.median / 1e9;
+    const double gflops_compute_mean = flops / compute_stats_v.mean / 1e9;
+    const double gflops_total_best = flops / total_stats.min / 1e9;
+    const double gflops_total_median = flops / total_stats.median / 1e9;
+    const double gflops_total_mean = flops / total_stats.mean / 1e9;
+    const double gib_total =
+        (double)(ctx->bytes_a + ctx->bytes_b + ctx->bytes_c) /
+        (1024.0 * 1024.0 * 1024.0);
+    char kernel_label[128];
+    build_kernel_label(ctx->kernel_kind, kernel_label, sizeof(kernel_label));
+
+    printf("------------------------------------------------------------\n");
+    printf("matmul baseline (double, row-major)\n");
+    printf("kernel=%s\n", kernel_label);
+    printf("M=%zu N=%zu K=%zu repeats=%zu alignment=%zuB\n", ctx->M, ctx->N, ctx->K,
+           ctx->repeats, ctx->alignment);
+    printf("A=%.3f MiB B=%.3f MiB C=%.3f MiB total=%.3f GiB\n",
+           (double)ctx->bytes_a / (1024.0 * 1024.0),
+           (double)ctx->bytes_b / (1024.0 * 1024.0),
+           (double)ctx->bytes_c / (1024.0 * 1024.0), gib_total);
+    printf("clear_time:   min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
+           clear_stats.min, clear_stats.median, clear_stats.mean,
+           clear_stats.stddev);
+    printf("compute_time: min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
+           compute_stats_v.min, compute_stats_v.median, compute_stats_v.mean,
+           compute_stats_v.stddev);
+    printf("total_time:   min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
+           total_stats.min, total_stats.median, total_stats.mean,
+           total_stats.stddev);
+    printf("gflops_compute: best=%.2f  median=%.2f  mean=%.2f\n",
+           gflops_compute_best, gflops_compute_median, gflops_compute_mean);
+    printf("gflops_total:   best=%.2f  median=%.2f  mean=%.2f\n",
+           gflops_total_best, gflops_total_median, gflops_total_mean);
+    printf("checksum_guard=%.6e\n", (double)g_sink);
+    printf("------------------------------------------------------------\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     size_t M = 1024, N = 1024, K = 1024;
     size_t repeats = 5;
     matmul_kernel_t kernel = matmul_naive;
     kernel_kind_t kernel_kind = KERNEL_NAIVE;
     size_t opt_bm = 0, opt_bk = 0, opt_bn = 0;
+    int roundtile = 0;
     int verify = 0;
     double tol = 1e-9;
     int argi = 1;
@@ -262,6 +396,11 @@ int main(int argc, char **argv) {
         break;
     }
 
+    if (argi < argc && strcmp(argv[argi], "roundtile") == 0) {
+        roundtile = 1;
+        ++argi;
+    }
+
     const int rem = argc - argi;
     if (rem == 1 || rem == 2) {
         if (parse_size_arg(argv[argi], &N) != 0) {
@@ -290,7 +429,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (opt_bm > 0 || opt_bk > 0 || opt_bn > 0) {
+    if (roundtile) {
+        if (kernel_kind != KERNEL_BLOCK) {
+            fprintf(stderr, "roundtile is only supported with --kernel block\n");
+            return 1;
+        }
+        if (opt_bm > 0 || opt_bk > 0 || opt_bn > 0) {
+            fprintf(stderr,
+                    "roundtile cannot be combined with manual --bm/--bk/--bn values\n");
+            return 1;
+        }
+    }
+
+    if (!roundtile && (opt_bm > 0 || opt_bk > 0 || opt_bn > 0)) {
         size_t bm = 0, bk = 0, bn = 0;
         matmul_block_get_tiles(&bm, &bk, &bn);
         if (opt_bm > 0) {
@@ -348,123 +499,50 @@ int main(int argc, char **argv) {
 
     fill_random(A, elems_a, 0x123456789abcdef0ULL);
     fill_random(B, elems_b, 0x0fedcba987654321ULL);
+    benchmark_ctx_t ctx = {
+        .M = M,
+        .N = N,
+        .K = K,
+        .repeats = repeats,
+        .bytes_a = bytes_a,
+        .bytes_b = bytes_b,
+        .bytes_c = bytes_c,
+        .elems_c = elems_c,
+        .alignment = alignment,
+        .verify = verify,
+        .tol = tol,
+        .kernel_kind = kernel_kind,
+        .kernel = kernel,
+        .A = A,
+        .B = B,
+        .C = C,
+        .clear_times = clear_times,
+        .compute_times = compute_times,
+        .total_times = total_times,
+    };
 
-    if (verify) {
-        double *C_ref = (double *)aligned_alloc_or_null(alignment, bytes_c);
-        if (!C_ref) {
-            fprintf(stderr, "verification allocation failed (C_ref)\n");
-            free(A);
-            free(B);
-            free(C);
-            free(clear_times);
-            free(compute_times);
-            free(total_times);
-            return 1;
+    int rc = 0;
+    if (roundtile) {
+        static const size_t bk_candidates[] = {4, 8, 16, 32, 64};
+        static const size_t bm_bn_candidates[] = {16, 32, 64, 128};
+        for (size_t ibk = 0; ibk < sizeof(bk_candidates) / sizeof(bk_candidates[0]);
+             ++ibk) {
+            for (size_t ibm = 0;
+                 ibm < sizeof(bm_bn_candidates) / sizeof(bm_bn_candidates[0]); ++ibm) {
+                matmul_block_set_tiles(bm_bn_candidates[ibm], bk_candidates[ibk],
+                                       bm_bn_candidates[ibm]);
+                rc = run_benchmark(&ctx);
+                if (rc != 0) {
+                    break;
+                }
+            }
+            if (rc != 0) {
+                break;
+            }
         }
-
-        memset(C_ref, 0, bytes_c);
-        matmul_naive(M, N, K, A, B, C_ref);
-        memset(C, 0, bytes_c);
-        kernel(M, N, K, A, B, C);
-
-        double max_abs_err = 0.0;
-        double max_rel_err = 0.0;
-        int ok = verify_result(C_ref, C, elems_c, tol, &max_abs_err, &max_rel_err);
-
-        printf("verify=%s tol=%.3e max_abs_err=%.3e max_rel_err=%.3e\n",
-               ok ? "PASS" : "FAIL", tol, max_abs_err, max_rel_err);
-
-        free(C_ref);
-        if (!ok) {
-            fprintf(stderr,
-                    "verification failed: error exceeds tolerance (tol=%.3e)\n", tol);
-            free(A);
-            free(B);
-            free(C);
-            free(clear_times);
-            free(compute_times);
-            free(total_times);
-            return 2;
-        }
-    }
-
-    memset(C, 0, bytes_c);
-    kernel(M, N, K, A, B, C);
-
-    for (size_t r = 0; r < repeats; ++r) {
-        const double t_total0 = now_sec();
-        const double t_clear0 = now_sec();
-        memset(C, 0, bytes_c);
-        const double t_clear1 = now_sec();
-        const double t_compute0 = t_clear1;
-        kernel(M, N, K, A, B, C);
-        const double t_compute1 = now_sec();
-        clear_times[r] = t_clear1 - t_clear0;
-        compute_times[r] = t_compute1 - t_compute0;
-        total_times[r] = t_compute1 - t_total0;
-        g_sink += C[r % elems_c];
-    }
-
-    stats_t clear_stats;
-    stats_t compute_stats_v;
-    stats_t total_stats;
-    if (compute_stats(clear_times, repeats, &clear_stats) != 0 ||
-        compute_stats(compute_times, repeats, &compute_stats_v) != 0 ||
-        compute_stats(total_times, repeats, &total_stats) != 0) {
-        fprintf(stderr, "failed to compute timing statistics\n");
-        free(A);
-        free(B);
-        free(C);
-        free(clear_times);
-        free(compute_times);
-        free(total_times);
-        return 1;
-    }
-
-    const double flops = 2.0 * (double)M * (double)N * (double)K;
-    const double gflops_compute_best = flops / compute_stats_v.min / 1e9;
-    const double gflops_compute_median = flops / compute_stats_v.median / 1e9;
-    const double gflops_compute_mean = flops / compute_stats_v.mean / 1e9;
-    const double gflops_total_best = flops / total_stats.min / 1e9;
-    const double gflops_total_median = flops / total_stats.median / 1e9;
-    const double gflops_total_mean = flops / total_stats.mean / 1e9;
-    const double gib_total =
-        (double)(bytes_a + bytes_b + bytes_c) / (1024.0 * 1024.0 * 1024.0);
-    char kernel_label[128];
-    if (kernel_kind == KERNEL_NAIVE) {
-        (void)snprintf(kernel_label, sizeof(kernel_label), "naive(i-j-k)");
-    } else if (kernel_kind == KERNEL_ROWMAJOR) {
-        (void)snprintf(kernel_label, sizeof(kernel_label), "rowmajor(i-k-j)");
     } else {
-        size_t bm = 0, bk = 0, bn = 0;
-        matmul_block_get_tiles(&bm, &bk, &bn);
-        (void)snprintf(kernel_label, sizeof(kernel_label),
-                       "blocked(ii-jj-kk, i-k-j) BM=%zu BN=%zu BK=%zu", bm, bn, bk);
+        rc = run_benchmark(&ctx);
     }
-
-    printf("------------------------------------------------------------\n");
-    printf("matmul baseline (double, row-major)\n");
-    printf("kernel=%s\n", kernel_label);
-    printf("M=%zu N=%zu K=%zu repeats=%zu alignment=%zuB\n", M, N, K, repeats,
-           alignment);
-    printf("A=%.3f MiB B=%.3f MiB C=%.3f MiB total=%.3f GiB\n",
-           (double)bytes_a / (1024.0 * 1024.0), (double)bytes_b / (1024.0 * 1024.0),
-           (double)bytes_c / (1024.0 * 1024.0), gib_total);
-    printf("clear_time:   min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
-           clear_stats.min, clear_stats.median, clear_stats.mean,
-           clear_stats.stddev);
-    printf("compute_time: min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
-           compute_stats_v.min, compute_stats_v.median, compute_stats_v.mean,
-           compute_stats_v.stddev);
-    printf("total_time:   min=%.6f s  median=%.6f s  mean=%.6f s  stddev=%.6f s\n",
-           total_stats.min, total_stats.median, total_stats.mean,
-           total_stats.stddev);
-    printf("gflops_compute: best=%.2f  median=%.2f  mean=%.2f\n",
-           gflops_compute_best, gflops_compute_median, gflops_compute_mean);
-    printf("gflops_total:   best=%.2f  median=%.2f  mean=%.2f\n", gflops_total_best,
-           gflops_total_median, gflops_total_mean);
-    printf("checksum_guard=%.6e\n", (double)g_sink);
-    printf("------------------------------------------------------------\n");
 
     free(A);
     free(B);
@@ -472,5 +550,5 @@ int main(int argc, char **argv) {
     free(clear_times);
     free(compute_times);
     free(total_times);
-    return 0;
+    return rc;
 }

@@ -1,5 +1,6 @@
 CC ?= cc
-CFLAGS ?= -std=c11 -Wall -Wextra -O2 -Iinclude
+CPPFLAGS ?= -Iinclude
+CFLAGS ?= -std=c11 -Wall -Wextra -O2
 LDFLAGS ?=
 LDLIBS ?=
 
@@ -16,15 +17,15 @@ $(TARGET): $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 run: $(TARGET)
 	./$(TARGET) $(ARGS)
 
-debug: CFLAGS = -std=c11 -Wall -Wextra -O0 -g
+debug: CFLAGS += -O0 -g
 debug: clean all
 
-release: CFLAGS = -std=c11 -Wall -Wextra -O3 -DNDEBUG
+release: CFLAGS += -O3 -DNDEBUG
 release: clean all
 
 clean:
