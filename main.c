@@ -10,7 +10,8 @@
 #include "matmul.h"
 
 typedef void (*matmul_kernel_t)(size_t M, size_t N, size_t K,
-                                const double *A, const double *B,
+                                const double *restrict A,
+                                const double *restrict B,
                                 double *restrict C);
 
 typedef enum kernel_kind {

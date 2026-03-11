@@ -6,7 +6,8 @@
  * Loop order: i-k-j
  */
 void matmul_naive_rowmajor(size_t M, size_t N, size_t K,
-                           const double *A, const double *B,
+                           const double *restrict A,
+                           const double *restrict B,
                            double *restrict C) {
     for (size_t i = 0; i < M; ++i) {
         double *c_row = &C[i * N];

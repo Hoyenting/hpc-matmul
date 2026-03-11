@@ -48,7 +48,8 @@ void matmul_block_get_tiles(size_t *BM, size_t *BK, size_t *BN) {
  * Inner loops: i-k-j
  */
 void matmul_block(size_t M, size_t N, size_t K,
-                  const double *A, const double *B, double *restrict C) {
+                  const double *restrict A, const double *restrict B,
+                  double *restrict C) {
     const size_t BM = g_block_bm;
     const size_t BK = g_block_bk;
     const size_t BN = g_block_bn;
