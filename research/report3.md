@@ -11,11 +11,11 @@ Scope: `main.c` + `src/matmul_block.c`
 Test commands:
 
 ```bash
-./matmul --kernel blocked --bm 128 --bn 128 --bk 8 1024
-./matmul --kernel blocked --bm 128 --bn 128 --bk 4 1024
-./matmul --kernel blocked --bm 128 --bn 128 --bk 16 1024
-./matmul --kernel blocked --bm 128 --bn 128 --bk 32 1024
-./matmul --kernel blocked --bm 128 --bn 128 --bk 64 1024
+./matmul --kernel block --bm 128 --bn 128 --bk 8 1024 5
+./matmul --kernel block --bm 128 --bn 128 --bk 4 1024 5
+./matmul --kernel block --bm 128 --bn 128 --bk 16 1024 5
+./matmul --kernel block --bm 128 --bn 128 --bk 32 1024 5
+./matmul --kernel block --bm 128 --bn 128 --bk 64 1024 5
 ```
 
 Observed values (snapshot):
