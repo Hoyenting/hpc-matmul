@@ -524,8 +524,8 @@ int main(int argc, char **argv) {
 
     int rc = 0;
     if (roundtile) {
-        static const size_t bk_candidates[] = {4, 8, 16, 32, 64};
-        static const size_t bm_bn_candidates[] = {16, 32, 64, 128};
+        static const size_t bk_candidates[] = {1, 2, 4};
+        static const size_t bm_bn_candidates[] = {256, 512, 1024, 2048};
         for (size_t ibk = 0; ibk < sizeof(bk_candidates) / sizeof(bk_candidates[0]);
              ++ibk) {
             for (size_t ibm = 0;
