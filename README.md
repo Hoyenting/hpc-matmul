@@ -5,87 +5,91 @@
 ## README Scope
 
 本文件聚焦「成果展示」與「實驗方法」。  
-階段性問題與研究觀察請見：`research/report1.md`。
+階段性問題與研究觀察請見 `research/` 目錄下各 report。
 
 ## Repository Structure
 
-- `main.c`: baseline benchmarking harness（隨機初始化、計時、GFLOPS 輸出）
-- `src/matmul_naive.c`: Phase 0 參考實作（3 層迴圈 naive matmul）
-- `bench/`: 後續 benchmarking scripts
-- `tests/`: correctness tests
-- `results/`: 實驗輸出（建議放 CSV / log）
-- `scripts/`: 輔助腳本
-- `research/`: 研究紀錄與問題追蹤
+- `main.c`: benchmarking harness（隨機初始化、計時、GFLOPS 輸出、correctness 驗證）
+- `src/matmul_naive.c`: Phase 0 — naive i-j-k baseline
+- `src/matmul_naive_rowmajor.c`: Phase 1 — loop reorder i-k-j
+- `src/matmul_block.c`: Phase 2 — cache-blocked tiling
+- `src/matmul_regblock.c`: Phase 3 — register-blocked micro-kernel (4×4)
+- `include/matmul.h`: 所有 kernel 的公開介面
+- `research/`: 各 phase 的問題紀錄與觀察報告
+- `bench/`, `tests/`, `results/`, `scripts/`: 後續擴充用目錄
 
-## Phase 0: Naive Baseline (Current Milestone)
+## Optimization Phases
 
-### Milestone Objective
+### Phase 0: Naive Baseline
 
-建立可重現、可比較的 baseline，作為後續 blocking / SIMD / parallel 優化的對照組。
+`src/matmul_naive.c` — i-j-k loop order，B 矩陣跨列存取，cache miss 頻繁。
 
-### Kernel
-
-- `C[MxN] = A[MxK] * B[KxN]`
-- row-major layout
-- `double` precision
-- 目前可切換 baseline kernel：
-  - `naive`（`i-j-k`）
-  - `rowmajor`（`i-k-j`，較佳 row-major locality）
-
-### Fair Profiling Design
-
-- 記憶體使用 `posix_memalign` 做 `128B` 對齊
-- 預設測試規模為 `N=1024`（可輸入更大）
-- 先做 1 次 warm-up，不納入統計
-- kernel 語意統一為 `C = A * B`（kernel 內部完整寫滿 `C`）
-- 正式重複執行多次，輸出 `min/median/mean/stddev` 時間統計
-- GFLOPS 依時間統計計算（至少 `gflops_median`, `gflops_mean`）
-- 以 `checksum_guard` 防止計算被不當優化掉
-
-### CLI Parameters (Benchmark / Verify)
-
-- `--kernel naive|rowmajor`: 切換被測 kernel
-- `--verify`: 啟用 correctness 驗證（reference 使用 `naive`）
-- `--tol <value>`: 設定誤差容忍（`double`，預設 `1e-9`）
-
-輸入形式：
-
-- `./matmul`
-- `./matmul N [repeats]`
-- `./matmul M N K [repeats]`
-- 以上形式可與 `--kernel`、`--verify`、`--tol` 組合使用
-
-### Output Fields (Current)
-
-- `min_time`: repeats 中最小時間（秒）
-- `median_time`: repeats 的中位數時間（秒）
-- `mean_time`: repeats 的平均時間（秒）
-- `stddev_time`: repeats 的標準差（秒）
-- `gflops_best`: 以 `min_time` 計算的 GFLOPS
-- `gflops_median`: 以 `median_time` 計算的 GFLOPS
-- `gflops_mean`: 以 `mean_time` 計算的 GFLOPS
-- `checksum_guard`: 防止編譯器不當移除計算
-- `verify=PASS/FAIL`, `max_abs_err`, `max_rel_err`（啟用 `--verify` 時）
-
-## Build and Run (Minimal)
-
-```bash
-make
-./matmul
-./matmul --kernel rowmajor 1024 5
-./matmul --verify --kernel rowmajor --tol 1e-9 1024 3
-./matmul 1024 3
-./matmul 1024 1024 1024 3
+```
+~2.1 GFLOPS  (N=1024, Apple M3, -O3 -march=native)
 ```
 
-備註：目前 `Makefile` 預設會編譯 `main.c`、`src/matmul_naive.c`、`src/matmul_naive_rowmajor.c`。
+### Phase 1: Loop Reorder
 
-## Current Baseline Snapshot (Apple Silicon MacBook Air M3)
+`src/matmul_naive_rowmajor.c` — 改為 i-k-j loop order，B 矩陣由跨列改為循序存取，顯著改善 spatial locality。
 
-一次實測範例（`./matmul 1024 3`）：
+```
+~14.9 GFLOPS
+```
 
-- `min_time ≈ 1.96 s`
-- `median_time / mean_time`（依 repeats 與當下環境波動）
-- `gflops_best / gflops_median / gflops_mean`
+### Phase 2: Cache Blocking
 
-> 此數值為當下環境快照，用於階段比較；正式報告建議記錄多次 run 與統計分布。
+`src/matmul_block.c` — 外層 ii-jj-kk tiling（BM×BK×BN 區塊），讓工作集合留在 L1/L2 快取內，提升 temporal locality。
+
+```
+~16.9 GFLOPS  (BM=128, BN=128, BK=8)
+```
+
+### Phase 3: Register Blocking
+
+`src/matmul_regblock.c` — 在 cache tiling 之上加入 4×4 register micro-kernel。16 個 local accumulator（`c00..c33`）在整個 k-loop 中保持在 register，完全消除對 C 矩陣的反覆 load/store，最後一次性 write back。
+
+Compiler 在此結構下自動生成 ARM NEON `fmla.2d` + `ld1r.2d`（128-bit SIMD），無需手寫 intrinsics。
+
+```
+~23 GFLOPS   (BM=128, BN=128, BK=8, default)
+~31 GFLOPS   (BM=512, BN=512, BK=8, best config)
+```
+
+整體加速比（vs naive baseline）：**~15x**
+
+## Build and Run
+
+```bash
+make                                              # 預設 -O2
+make CFLAGS="-std=c11 -Wall -Wextra -O3 -march=native"   # release build
+
+./matmul                                          # naive, N=1024, 5 repeats
+./matmul --kernel rowmajor 1024 5
+./matmul --kernel block --bm 128 --bk 8 --bn 128 1024 5
+./matmul --kernel regblock 1024 5
+./matmul --kernel regblock --bm 512 --bk 8 --bn 512 1024 5
+
+./matmul --kernel regblock --verify 1024 3        # correctness check
+```
+
+可用 `--kernel` 切換：`naive` | `rowmajor` | `block` | `regblock`  
+可用 `--bm`、`--bk`、`--bn` 覆蓋 tile 大小（block / regblock kernel）  
+可用 `--verify` 對照 naive reference 驗證數值正確性
+
+## Performance Summary (Apple Silicon MacBook Air M3)
+
+| Phase | Kernel | GFLOPS (best) |
+|-------|--------|---------------|
+| 0 | naive (i-j-k) | ~2.1 |
+| 1 | rowmajor (i-k-j) | ~14.9 |
+| 2 | cache-blocked | ~16.9 |
+| 3 | register-blocked (4×4) | ~30.8 |
+
+> 數值為實測快照，環境：macOS、Clang、`-O3 -march=native`、N=1024。
+
+## Research Reports
+
+- `research/report1.md` — Phase 0 naive baseline 問題紀錄
+- `research/report2.md` — Phase 1 loop reorder 觀察
+- `research/report3.md` — Phase 2 cache blocking 分析（BK/BM/BN sweep）
+- `research/report4.md` — Phase 3 register blocking 分析（micro-kernel 設計、NEON 向量化確認）
