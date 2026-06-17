@@ -17,7 +17,8 @@ typedef void (*matmul_kernel_t)(size_t M, size_t N, size_t K,
 typedef enum kernel_kind {
     KERNEL_NAIVE = 0,
     KERNEL_ROWMAJOR = 1,
-    KERNEL_BLOCK = 2
+    KERNEL_BLOCK = 2,
+    KERNEL_REGBLOCK = 3
 } kernel_kind_t;
 
 static volatile double g_sink = 0.0;
@@ -48,6 +49,11 @@ static int resolve_kernel(const char *name, matmul_kernel_t *fn_out,
     if (strcmp(name, "block") == 0 || strcmp(name, "blocked") == 0) {
         *fn_out = matmul_block;
         *kind_out = KERNEL_BLOCK;
+        return 0;
+    }
+    if (strcmp(name, "regblock") == 0) {
+        *fn_out = matmul_regblock;
+        *kind_out = KERNEL_REGBLOCK;
         return 0;
     }
     return -1;
@@ -224,11 +230,17 @@ static void build_kernel_label(kernel_kind_t kernel_kind, char *buf,
         (void)snprintf(buf, buf_size, "naive(i-j-k)");
     } else if (kernel_kind == KERNEL_ROWMAJOR) {
         (void)snprintf(buf, buf_size, "rowmajor(i-k-j)");
-    } else {
+    } else if (kernel_kind == KERNEL_BLOCK) {
         size_t bm = 0, bk = 0, bn = 0;
         matmul_block_get_tiles(&bm, &bk, &bn);
         (void)snprintf(buf, buf_size,
                        "blocked(ii-jj-kk, i-k-j) BM=%zu BN=%zu BK=%zu", bm, bn, bk);
+    } else {
+        size_t bm = 0, bk = 0, bn = 0;
+        matmul_regblock_get_tiles(&bm, &bk, &bn);
+        (void)snprintf(buf, buf_size,
+                       "regblock(ii-jj-kk, %zux%zu reg, i-k-j) BM=%zu BN=%zu BK=%zu",
+                       matmul_regblock_rm(), matmul_regblock_rn(), bm, bn, bk);
     }
 }
 
@@ -431,8 +443,8 @@ int main(int argc, char **argv) {
     }
 
     if (roundtile) {
-        if (kernel_kind != KERNEL_BLOCK) {
-            fprintf(stderr, "roundtile is only supported with --kernel block\n");
+        if (kernel_kind != KERNEL_BLOCK && kernel_kind != KERNEL_REGBLOCK) {
+            fprintf(stderr, "roundtile is only supported with --kernel block/regblock\n");
             return 1;
         }
         if (opt_bm > 0 || opt_bk > 0 || opt_bn > 0) {
@@ -444,17 +456,19 @@ int main(int argc, char **argv) {
 
     if (!roundtile && (opt_bm > 0 || opt_bk > 0 || opt_bn > 0)) {
         size_t bm = 0, bk = 0, bn = 0;
-        matmul_block_get_tiles(&bm, &bk, &bn);
-        if (opt_bm > 0) {
-            bm = opt_bm;
+        if (kernel_kind == KERNEL_BLOCK) {
+            matmul_block_get_tiles(&bm, &bk, &bn);
+        } else if (kernel_kind == KERNEL_REGBLOCK) {
+            matmul_regblock_get_tiles(&bm, &bk, &bn);
         }
-        if (opt_bk > 0) {
-            bk = opt_bk;
+        if (opt_bm > 0) bm = opt_bm;
+        if (opt_bk > 0) bk = opt_bk;
+        if (opt_bn > 0) bn = opt_bn;
+        if (kernel_kind == KERNEL_BLOCK) {
+            matmul_block_set_tiles(bm, bk, bn);
+        } else if (kernel_kind == KERNEL_REGBLOCK) {
+            matmul_regblock_set_tiles(bm, bk, bn);
         }
-        if (opt_bn > 0) {
-            bn = opt_bn;
-        }
-        matmul_block_set_tiles(bm, bk, bn);
     }
 
     if (repeats == 0) {
@@ -530,8 +544,14 @@ int main(int argc, char **argv) {
              ++ibk) {
             for (size_t ibm = 0;
                  ibm < sizeof(bm_bn_candidates) / sizeof(bm_bn_candidates[0]); ++ibm) {
-                matmul_block_set_tiles(bm_bn_candidates[ibm], bk_candidates[ibk],
-                                       bm_bn_candidates[ibm]);
+                if (kernel_kind == KERNEL_REGBLOCK) {
+                    matmul_regblock_set_tiles(bm_bn_candidates[ibm],
+                                             bk_candidates[ibk],
+                                             bm_bn_candidates[ibm]);
+                } else {
+                    matmul_block_set_tiles(bm_bn_candidates[ibm], bk_candidates[ibk],
+                                          bm_bn_candidates[ibm]);
+                }
                 rc = run_benchmark(&ctx);
                 if (rc != 0) {
                     break;

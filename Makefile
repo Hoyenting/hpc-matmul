@@ -6,7 +6,7 @@ LDFLAGS ?=
 LDLIBS ?=
 
 TARGET ?= matmul
-SRC ?= main.c src/matmul_naive.c src/matmul_naive_rowmajor.c src/matmul_block.c
+SRC ?= main.c src/matmul_naive.c src/matmul_naive_rowmajor.c src/matmul_block.c src/matmul_regblock.c
 OBJ := $(SRC:.c=.o)
 ASM_SRC ?= src/matmul_block.c
 ASM_OUT ?= $(ASM_SRC:.c=.s)

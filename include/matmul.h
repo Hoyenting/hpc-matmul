@@ -19,4 +19,13 @@ void matmul_block(size_t M, size_t N, size_t K,
 void matmul_block_set_tiles(size_t BM, size_t BK, size_t BN);
 void matmul_block_get_tiles(size_t *BM, size_t *BK, size_t *BN);
 
+void matmul_regblock(size_t M, size_t N, size_t K,
+                     const double *restrict A, const double *restrict B,
+                     double *restrict C);
+
+void matmul_regblock_set_tiles(size_t BM, size_t BK, size_t BN);
+void matmul_regblock_get_tiles(size_t *BM, size_t *BK, size_t *BN);
+size_t matmul_regblock_rm(void);
+size_t matmul_regblock_rn(void);
+
 #endif
