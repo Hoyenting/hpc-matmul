@@ -1,7 +1,11 @@
 # 執行檔
 matrix_benchmark
+matmul
 *.out
 *.exe
+
+# 編譯產生的組語檔
+*.s
 
 # 編譯產生的物件檔
 *.o
